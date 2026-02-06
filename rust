@@ -1,0 +1,135 @@
+#!/bin/bash
+set -euo pipefail
+
+# Generic installer for GitHub-released Rust binaries.
+# Designed to be sourced by a thin wrapper script that sets:
+#   INSTALL_REPO        — GitHub owner/repo (e.g. "kyeotic/stack-sync")
+#   INSTALL_BINARY      — binary name (e.g. "stack-sync")
+#
+# Optional overrides (env vars or exported before sourcing):
+#   INSTALL_DIR         — skip auto-detection; install here
+#   INSTALL_VERSION     — specific tag to install (default: latest)
+#   INSTALL_ASSET_PATTERN — custom asset name pattern; receives {binary}, {target}, {tag}
+#                           default: "{binary}-{target}.tar.gz"
+
+# --- Validate required inputs ------------------------------------------------
+
+if [ -z "${INSTALL_REPO:-}" ]; then
+    echo "Error: INSTALL_REPO is required (e.g. kyeotic/stack-sync)"
+    exit 1
+fi
+
+if [ -z "${INSTALL_BINARY:-}" ]; then
+    echo "Error: INSTALL_BINARY is required (e.g. stack-sync)"
+    exit 1
+fi
+
+# --- Detect platform ----------------------------------------------------------
+
+case "$(uname -s)" in
+    Darwin) os="apple-darwin" ;;
+    Linux)  os="unknown-linux-musl" ;;
+    *)      echo "Unsupported OS: $(uname -s)"; exit 1 ;;
+esac
+
+case "$(uname -m)" in
+    x86_64|amd64)  arch="x86_64" ;;
+    arm64|aarch64) arch="aarch64" ;;
+    *)             echo "Unsupported architecture: $(uname -m)"; exit 1 ;;
+esac
+
+if [ "$os" = "unknown-linux-musl" ] && [ "$arch" != "x86_64" ]; then
+    echo "Unsupported Linux architecture: $arch"
+    exit 1
+fi
+
+target="${arch}-${os}"
+
+# --- Pick install directory ---------------------------------------------------
+
+pick_install_dir() {
+    local candidates=(
+        "${HOME}/.local/bin"
+        "/usr/local/bin"
+        "${HOME}/bin"
+    )
+
+    for dir in "${candidates[@]}"; do
+        # Must exist (or be creatable) AND be writable AND be in PATH
+        if [ -d "$dir" ] && [ -w "$dir" ] && echo ":${PATH}:" | grep -q ":${dir}:"; then
+            echo "$dir"
+            return
+        fi
+    done
+
+    return 1
+}
+
+if [ -n "${INSTALL_DIR:-}" ]; then
+    install_dir="$INSTALL_DIR"
+else
+    if install_dir=$(pick_install_dir); then
+        echo "Selected install directory: ${install_dir}"
+    else
+        echo "No suitable install directory found in PATH."
+        echo "Checked: ~/.local/bin, /usr/local/bin, ~/bin"
+        echo ""
+        # Only prompt if stdin is a terminal
+        if [ -t 0 ]; then
+            printf "Enter install directory: "
+            read -r install_dir
+        else
+            echo "Error: no suitable directory found and stdin is not a terminal (piped install)."
+            echo "Set INSTALL_DIR to specify a directory. Example:"
+            echo "  curl -fsSL ... | INSTALL_DIR=~/.local/bin bash"
+            exit 1
+        fi
+    fi
+fi
+
+# Create directory if it doesn't exist
+if [ ! -d "$install_dir" ]; then
+    echo "Creating ${install_dir}..."
+    mkdir -p "$install_dir"
+fi
+
+# Final writability check
+if [ ! -w "$install_dir" ]; then
+    echo "Error: ${install_dir} is not writable by the current user"
+    exit 1
+fi
+
+# --- Fetch version ------------------------------------------------------------
+
+if [ -n "${INSTALL_VERSION:-}" ]; then
+    tag="$INSTALL_VERSION"
+    echo "Using specified version: ${tag}"
+else
+    echo "Fetching latest release..."
+    tag=$(curl -fsSL "https://api.github.com/repos/${INSTALL_REPO}/releases/latest" | grep '"tag_name"' | cut -d'"' -f4)
+
+    if [ -z "$tag" ]; then
+        echo "Failed to fetch latest release tag"
+        exit 1
+    fi
+fi
+
+# --- Download and install -----------------------------------------------------
+
+asset_pattern="${INSTALL_ASSET_PATTERN:-"{binary}-{target}.tar.gz"}"
+asset_name="${asset_pattern//\{binary\}/$INSTALL_BINARY}"
+asset_name="${asset_name//\{target\}/$target}"
+asset_name="${asset_name//\{tag\}/$tag}"
+
+url="https://github.com/${INSTALL_REPO}/releases/download/${tag}/${asset_name}"
+
+echo "Downloading ${INSTALL_BINARY} ${tag} for ${target}..."
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
+
+curl -fsSL "$url" | tar xz -C "$tmpdir"
+
+mv "$tmpdir/${INSTALL_BINARY}" "${install_dir}/${INSTALL_BINARY}"
+chmod +x "${install_dir}/${INSTALL_BINARY}"
+
+echo "${INSTALL_BINARY} ${tag} installed to ${install_dir}/${INSTALL_BINARY}"
